@@ -2235,6 +2235,78 @@ def fill_albums(out_dir: Path, extra: int, full: bool, workers: int, use_browser
     print("=" * 60)
 
 
+GENRE_PLAYLIST_PREFIX = "Album Extras - "   # keeps them together, apart from your curated lists
+GENRE_PLAYLIST_MIN    = 5                   # don't clutter iTunes with 1-track genre lists
+
+
+def _extras_meta(path: Path) -> tuple:
+    """(genre, artist, title, seconds) in a single file read."""
+    try:
+        from mutagen.mp3 import MP3
+        from mutagen.id3 import ID3
+        audio = MP3(path, ID3=ID3)
+        tags = audio.tags
+
+        def txt(key):
+            frame = tags.get(key) if tags else None
+            return frame.text[0] if (frame and frame.text and frame.text[0]) else ""
+
+        return (canonical_genre(txt("TCON")),
+                txt("TPE1") or txt("TPE2"),
+                txt("TIT2") or path.stem,
+                round(audio.info.length) if audio.info else -1)
+    except Exception:
+        return (None, "", path.stem, -1)
+
+
+def build_genre_playlists(out_dir: Path, pl_dir: Path, workers: int = 8) -> tuple:
+    """One .m3u8 per genre for the Album Extras. Those tracks belong to no curated
+    playlist (they came from completing albums), so grouping them by genre gives them a
+    home. Genres with fewer than GENRE_PLAYLIST_MIN tracks are left to iTunes' own genre
+    browser rather than becoming near-empty playlists."""
+    extras_dir = out_dir / "audio" / sanitize_filename(ALBUM_EXTRAS_COLLECTION)
+    if not extras_dir.exists():
+        return (0, 0)
+    files = sorted(extras_dir.rglob("*.mp3"))
+    if not files:
+        return (0, 0)
+
+    log(f"Genre playlists: reading tags from {len(files)} Album Extras file(s)...")
+    groups: dict = collections.defaultdict(list)
+    lock = threading.Lock()
+
+    def work(path: Path) -> None:
+        genre, artist, title, seconds = _extras_meta(path)
+        if not genre:
+            return
+        with lock:
+            groups[genre].append((path, artist, title, seconds))
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(work, files))
+
+    written = referenced = 0
+    for genre, entries in sorted(groups.items()):
+        if len(entries) < GENRE_PLAYLIST_MIN:
+            continue
+        entries.sort(key=lambda e: (e[1].lower(), e[2].lower()))    # artist, then title
+        lines = ["#EXTM3U"]
+        for path, artist, title, seconds in entries:
+            lines.append(f"#EXTINF:{seconds},{artist} - {title}".rstrip(" -"))
+            lines.append(str(path))
+        name = sanitize_filename(f"{GENRE_PLAYLIST_PREFIX}{genre}", max_len=80)
+        with open(pl_dir / f"{name}.m3u8", "w", encoding="utf-8", newline="\r\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        written += 1
+        referenced += len(entries)
+        log(f"  {name}.m3u8 -> {len(entries)} track(s)")
+
+    skipped = sum(len(v) for k, v in groups.items() if len(v) < GENRE_PLAYLIST_MIN)
+    if skipped:
+        log(f"  ({skipped} track(s) in genres under {GENRE_PLAYLIST_MIN} - browse those by genre in iTunes)")
+    return (written, referenced)
+
+
 def build_playlists(out_dir: Path) -> None:
     """Write one .m3u8 per CSV, ready to import into iTunes / Apple Music.
 
@@ -2299,10 +2371,13 @@ def build_playlists(out_dir: Path) -> None:
         flag = f"  ({missing} not downloaded yet)" if missing else ""
         log(f"  {candidate}.m3u8 -> {found} track(s){flag}")
 
+    genre_lists, genre_tracks = build_genre_playlists(out_dir, pl_dir)
+
     print("\n" + "=" * 60)
     print(f"  Playlists written : {len(names)}  ->  {pl_dir}")
     print(f"  Tracks referenced : {total_tracks}")
     print(f"  Not yet downloaded: {total_missing}")
+    print(f"  Genre playlists   : {genre_lists}  ({genre_tracks} Album Extras tracks)")
     print("=" * 60)
     print("  Import into iTunes / Apple Music:")
     print("    File > Library > Import Playlist...  then pick a .m3u8")
