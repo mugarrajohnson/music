@@ -1,0 +1,14 @@
+# Runtime dependencies for download_from_csv.py
+#   pip install -r requirements-downloader.txt
+#
+# ALSO REQUIRED (pip cannot install this): ffmpeg on PATH
+#   winget install Gyan.FFmpeg
+#
+# (requirements.txt covers the taste_analysis.ipynb notebook, not this script.)
+
+yt-dlp
+selenium
+mutagen
+requests
+tqdm
+Pillow

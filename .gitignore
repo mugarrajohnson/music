@@ -1,0 +1,21 @@
+# Secrets — cookies.txt is a LIVE login to your Google/YouTube session. Never commit it.
+cookies.txt
+*.cookies
+.env
+
+# Downloaded media and the ledger (large / machine-specific)
+downloads/
+download_history.json
+
+# Run logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS cruft
+Thumbs.db
+.DS_Store
