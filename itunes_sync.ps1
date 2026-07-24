@@ -27,7 +27,7 @@
 param(
     [string]$AudioRoot    = "D:\Downloads\audio",
     [string]$PlaylistsDir = "D:\Downloads\playlists",
-    [int]   $BatchSize    = 200
+    [int]   $BatchSize    = 500
 )
 
 $ErrorActionPreference = "Stop"
