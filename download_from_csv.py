@@ -1000,6 +1000,13 @@ GENRE_CASING = {
     "uk garage": "UK Garage", "k-pop": "K-Pop", "j-pop": "J-Pop", "p-pop": "P-Pop",
     "r&b/soul": "R&B", "hip-hop": "Hip-Hop", "hip hop": "Hip-Hop", "lo-fi": "Lo-Fi",
     "ccm": "CCM", "emo": "Emo", "rnb": "R&B",
+    # merge spellings that would otherwise become two near-identical genre playlists
+    "bongo-flava": "Bongo Flava", "bongoflava": "Bongo Flava",
+    "afro-beat": "Afrobeats", "afrobeat": "Afrobeats", "afro beat": "Afrobeats",
+    "afro-pop": "Afro-Pop", "afropop": "Afro-Pop", "afro pop": "Afro-Pop",
+    "afro-fusion": "Afro-Fusion", "afrofusion": "Afro-Fusion",
+    "afro-soul": "Afro Soul", "r and b": "R&B", "rhythm and blues": "R&B",
+    "roots reggae": "Roots Reggae", "folk-rock": "Folk-Rock", "folk rock": "Folk-Rock",
 }
 
 
@@ -1022,8 +1029,8 @@ def canonical_genre(genre: Optional[str]) -> Optional[str]:
     alias = GENRE_ALIASES.get(g.lower())
     if alias:
         return alias
-    # keep only the first genre listed
-    g = re.split(r"\s*[/,;|]\s*", g)[0].strip()
+    # keep only the first genre listed ("Christmas: Classic" -> "Christmas")
+    g = re.split(r"\s*[/,;|:]\s*", g)[0].strip()
     if not g or g.lower() in JUNK_GENRES:
         return None
     return GENRE_CASING.get(g.lower()) or _title_case(g)
@@ -1335,7 +1342,7 @@ def embed_cover_into_file(path: Path, data: bytes, mime: str) -> bool:
             tags = ID3()
         tags.delall("APIC")
         tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
-        tags.save(path)
+        save_id3(tags, path)
         return True
     except Exception as exc:
         log(f"  art embed failed for {path.name}: {exc}")
@@ -1409,7 +1416,7 @@ def stamp_reart(path: Path, status: str) -> None:
             tags = ID3()
         tags.delall("TXXX:REART")
         tags.add(TXXX(encoding=3, desc="REART", text=f"{status}@{now_stamp()}"))
-        tags.save(path)
+        save_id3(tags, path)
     except Exception:
         pass
 
@@ -1533,7 +1540,7 @@ def tag_mp3(path: Path, track: Track) -> None:
                 data, mime = cover
                 tags.delall("APIC")   # drop the 16:9 thumbnail yt-dlp embedded
                 tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
-        tags.save(path)
+        save_id3(tags, path)
     except Exception as exc:
         log(f"  tagging skipped: {exc}")
 
@@ -1595,7 +1602,7 @@ def retag_library(out_dir: Path, workers: int) -> None:
             if track is None:
                 # not in any CSV (renamed, or hand-added): still worth de-littering
                 strip_youtube_junk(tags)
-                tags.save(path)
+                save_id3(tags, path)
                 with lock:
                     stats["cleaned_only"] += 1
                 return
@@ -1605,7 +1612,7 @@ def retag_library(out_dir: Path, workers: int) -> None:
             genre = canonical_genre(frame.text[0] if (frame and frame.text) else None) \
                 or canonical_genre(track.genre)
             write_full_tags(tags, track, genre)
-            tags.save(path)
+            save_id3(tags, path)
             with lock:
                 stats["retagged"] += 1
                 if track.record_label:
@@ -1701,7 +1708,7 @@ def fix_genres(out_dir: Path, workers: int) -> None:
             # had a genre, but double-barrelled ("R&B/Soul") -> just collapse it
             if canon:
                 tags.setall("TCON", [TCON(encoding=3, text=canon)])
-                tags.save(path)
+                save_id3(tags, path)
                 with lock:
                     stats["normalized"] += 1
                 log(f"{current} -> {canon}  ({path.name})")
@@ -1718,14 +1725,14 @@ def fix_genres(out_dir: Path, workers: int) -> None:
 
             if genre:
                 tags.setall("TCON", [TCON(encoding=3, text=genre)])
-                tags.save(path)
+                save_id3(tags, path)
                 with lock:
                     stats["from_csv" if source == "csv" else "from_lookup"] += 1
                 log(f"{genre:<20} <- {path.name}")
             else:
                 if current:
                     tags.delall("TCON")
-                    tags.save(path)
+                    save_id3(tags, path)
                 with lock:
                     stats["still_unknown"] += 1
         except Exception as exc:
@@ -2067,7 +2074,7 @@ def group_tag_library(out_dir: Path, workers: int) -> None:
                     stats["unchanged"] += 1
                 return
             tags.setall("TIT1", [TIT1(encoding=3, text=value)])
-            tags.save(path)
+            save_id3(tags, path)
             with lock:
                 stats["updated"] += 1
                 if len(want) > 1:
@@ -2237,6 +2244,164 @@ def fill_albums(out_dir: Path, extra: int, full: bool, workers: int, use_browser
 
 GENRE_PLAYLIST_PREFIX = "Album Extras - "   # keeps them together, apart from your curated lists
 GENRE_PLAYLIST_MIN    = 5                   # don't clutter iTunes with 1-track genre lists
+
+
+# A finished download must look like real music. Anything failing these checks is a bad
+# grab (dead stream, wrong result, aborted transfer) and is rejected rather than kept.
+MIN_BITRATE_KBPS = 128
+MIN_DURATION_S   = 45
+# Titles that are legitimately short - album skits/interludes are not broken downloads.
+_SHORT_OK = re.compile(r"\b(skit|intro|outro|interlude|prelude|reprise|prologue|epilogue)\b", re.I)
+
+
+def audio_problem(path: Path, expected_s: Optional[int] = None,
+                  require_art: bool = False) -> Optional[str]:
+    """Short reason this file is not a usable music track, or None if it is fine."""
+    try:
+        if not path.exists():
+            return "missing"
+        if path.stat().st_size < 50_000:
+            return "tiny file"
+        from mutagen.mp3 import MP3
+        from mutagen.id3 import ID3
+        audio = MP3(path, ID3=ID3)
+        duration = audio.info.length or 0
+        bitrate = (audio.info.bitrate or 0) // 1000
+        tags = audio.tags
+    except Exception as exc:
+        return f"unreadable ({str(exc)[:34]})"
+
+    if duration <= 0:
+        return "zero length"
+    if expected_s and expected_s > 60 and duration < expected_s * 0.5:
+        return f"truncated ({int(duration)}s of ~{expected_s}s)"
+
+    floor = MIN_DURATION_S
+    if expected_s:                       # a track that is genuinely short is allowed to be
+        floor = min(MIN_DURATION_S, max(10, int(expected_s * 0.6)))
+    if duration < floor and not _SHORT_OK.search(path.stem):
+        return f"too short ({int(duration)}s)"
+
+    if bitrate and bitrate < MIN_BITRATE_KBPS:
+        return f"low bitrate ({bitrate}k)"
+    if require_art:
+        has_art = any(getattr(f, "FrameID", "") == "APIC" for f in (tags.values() if tags else []))
+        if not has_art:
+            return "no cover art"
+    return None
+
+
+def find_broken(out_dir: Path, apply: bool, workers: int) -> None:
+    """Report (and with apply=True, delete) files that are not usable music: corrupt,
+    zero-length, truncated, too short, low bitrate, or with no cover art. Deleted tracks
+    drop out of the ledger too, so the next normal run simply downloads them again."""
+    audio_root = out_dir / "audio"
+    files = sorted(audio_root.rglob("*.mp3"))
+    if not files:
+        log(f"No MP3 files found under {audio_root}")
+        return
+
+    expected = _expected_durations()          # song_key -> seconds, from the CSVs
+    log(f"Checking {len(files)} file(s) with {workers} workers...")
+
+    found: list = []
+    protected: list = []
+    lock = threading.Lock()
+    bar = tqdm(total=len(files), desc="Checking", unit="file", dynamic_ncols=True, colour="red")
+
+    def work(path: Path) -> None:
+        try:
+            want = expected.get(song_key_from_stem(path.stem))
+            reason = audio_problem(path, want, require_art=True)
+            if reason:
+                with lock:
+                    found.append((path, reason))
+            elif _SHORT_OK.search(path.stem):
+                with lock:
+                    protected.append(path)
+        except Exception as exc:
+            with lock:
+                found.append((path, f"check failed ({str(exc)[:30]})"))
+        finally:
+            bar.update(1)
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(work, files))
+    finally:
+        bar.close()
+
+    if not found:
+        print("\nNothing broken - every file passed.")
+        return
+
+    buckets: dict = collections.defaultdict(list)
+    for path, reason in found:
+        buckets[reason.split(" (")[0]].append((path, reason))
+
+    print("\n" + "=" * 66)
+    print(f"  Problem files: {len(found)} of {len(files)}")
+    print("=" * 66)
+    for kind in sorted(buckets):
+        rows = buckets[kind]
+        print(f"\n  {kind.upper()}  ({len(rows)})")
+        for path, reason in rows[:8]:
+            print(f"    {reason:28} {path.parent.name}/{path.name[:44]}")
+        if len(rows) > 8:
+            print(f"    ... and {len(rows) - 8} more")
+
+    freed = sum(p.stat().st_size for p, _ in found if p.exists()) / 1024 / 1024
+    print("\n" + "=" * 66)
+    print(f"  Total: {len(found)} file(s), {freed:.0f} MB")
+    if protected:
+        print(f"  Kept {len(protected)} genuinely short track(s) (skit/intro/interlude).")
+    if not apply:
+        print("  DRY RUN - nothing deleted. Re-run with --find-broken --apply to remove them.")
+        print("=" * 66)
+        return
+
+    deleted = 0
+    for path, _ in found:
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError as exc:
+            log(f"could not delete {path.name}: {exc}")
+    print(f"  Deleted {deleted} file(s).")
+    print("=" * 66)
+
+    history = DownloadHistory(out_dir / HISTORY_FILENAME, out_dir)
+    total = history.reindex()
+    log(f"Ledger rebuilt: {total} file(s), {len(history.data['tracks'])} songs. "
+        "Deleted tracks will be re-downloaded on the next run.")
+
+
+def save_id3(tags, path: Path) -> None:
+    """Save ID3 tags as v2.3, NOT mutagen's default v2.4.
+
+    iTunes / Apple Music on Windows only properly supports ID3 v2.2 and v2.3. Given a
+    v2.4 tag it frequently fails to read the artist frame and shows the track as
+    'By Unknown' even though TPE1 is present. update_to_v23() also rewrites v2.4-only
+    frames (e.g. TDRC -> TYER) so nothing is silently dropped.
+    """
+    # update_to_v23() drops the v2.4-only sort frames, so carry them over by hand -
+    # iTunes reads TSOP/TSOA/TSOT out of a v2.3 tag happily, and they are what makes
+    # "The Weeknd" file under W instead of T.
+    keep = {}
+    for key in ("TSOP", "TSOA", "TSOT", "TSO2"):
+        frame = tags.get(key)
+        if frame is not None:
+            keep[key] = frame
+    try:
+        tags.update_to_v23()
+    except Exception:
+        pass
+    for frame in keep.values():
+        try:
+            tags.add(frame)
+        except Exception:
+            pass
+    tags.save(path, v2_version=3)
 
 
 def _extras_meta(path: Path) -> tuple:
@@ -2505,14 +2670,27 @@ def process_one_csv(csv_path: Path, mode: str, out_dir: Path,
                 continue
 
             if need_audio:
+                problem = None
                 if download_audio(source, mp3, track.label):
-                    tag_mp3(mp3, track)
-                    history.record(track, "audio", mp3, collection, source)
-                    stats.audio_ok += 1
-                    log("  Audio OK")
+                    # a "successful" download can still be a dud (dead stream, wrong
+                    # result, aborted transfer) - throw it away so it retries next run
+                    problem = audio_problem(mp3, track.duration_s)
+                    if problem:
+                        try:
+                            mp3.unlink()
+                        except OSError:
+                            pass
+                    else:
+                        tag_mp3(mp3, track)
+                        history.record(track, "audio", mp3, collection, source)
+                        stats.audio_ok += 1
+                        log("  Audio OK")
                 else:
+                    problem = "download failed"
+                if problem:
                     stats.failed += 1
-                    stats.failures.append(f"{track.label} (audio)")
+                    stats.failures.append(f"{track.label} (audio: {problem})")
+                    log(f"  rejected: {problem}")
             if need_video:
                 if download_video(source, mp4, track.label):
                     history.record(track, "video", mp4, collection, source)
@@ -2647,18 +2825,31 @@ def run_parallel(items: list[WorkItem], totals: dict[str, int], mode: str,
             safe = sanitize_filename(track.label)
             if need_a:
                 mp3 = item.audio_dir / f"{fit_filename(item.audio_dir, safe, '.mp3')}.mp3"
+                problem = None
                 if download_audio(source, mp3, track.label, show_bar=False):
-                    tag_mp3(mp3, track)
-                    history.record(track, "audio", mp3, item.collection, source)
-                    with stats_lock:
-                        st.audio_ok += 1
-                        grand.audio_ok += 1
-                    log(f"audio OK: {track.label}")
+                    # reject duds (dead stream, wrong result, aborted transfer) so they
+                    # are not recorded as done - the next run will try them again
+                    problem = audio_problem(mp3, track.duration_s)
+                    if problem:
+                        try:
+                            mp3.unlink()
+                        except OSError:
+                            pass
+                    else:
+                        tag_mp3(mp3, track)
+                        history.record(track, "audio", mp3, item.collection, source)
+                        with stats_lock:
+                            st.audio_ok += 1
+                            grand.audio_ok += 1
+                        log(f"audio OK: {track.label}")
                 else:
+                    problem = "download failed"
+                if problem:
                     with stats_lock:
                         st.failed += 1
                         grand.failed += 1
-                        grand.failures.append(f"{track.label} (audio)")
+                        grand.failures.append(f"{track.label} (audio: {problem})")
+                    log(f"rejected [{problem}]: {track.label}")
             if need_v:
                 mp4 = item.video_dir / f"{fit_filename(item.video_dir, safe, '.mp4')}.mp4"
                 if download_video(source, mp4, track.label, show_bar=False):
@@ -2824,6 +3015,9 @@ def main() -> None:
     ap.add_argument("--fix-genres", action="store_true",
                     help="Repair the genre tag on existing MP3s (replace YouTube's 'Music' "
                          "with the CSV genre, else iTunes), then exit.")
+    ap.add_argument("--find-broken", action="store_true",
+                    help="Report unusable files (corrupt, zero-length, truncated, too short, "
+                         "low bitrate, no cover art). Add --apply to delete them, then exit.")
     ap.add_argument("--dedupe", action="store_true",
                     help="Report songs stored more than once under different filenames, then exit. "
                          "Nothing is deleted unless you add --apply.")
@@ -2890,6 +3084,10 @@ def main() -> None:
 
     if args.fix_genres:
         fix_genres(Path(args.out), workers=workers)
+        return
+
+    if args.find_broken:
+        find_broken(Path(args.out), apply=args.apply, workers=workers)
         return
 
     if args.dedupe:
